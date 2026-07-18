@@ -1,0 +1,118 @@
+(ns husbandry.advisor
+  "Farm Scheduling Advisor — the advisor named in this repository's
+  README, proposing a farm scheduling/logistics-coordination
+  operation (log a feeding-schedule/animal-condition-check-in record,
+  schedule a crew/task operation, flag an animal-welfare/injury-risk
+  concern for human review, or coordinate a feed/supplies procurement
+  order) from a farm's intake queue, worker roster and supply policy.
+  Swappable mock/llm; the advisor ONLY proposes — `husbandry.governor`
+  checks worker/farm verification and scope independently and always
+  escalates welfare-concern flags and above-threshold supply orders.
+  Modeled on cloud-itonami-isco-9332's cartage.advisor.
+
+  This advisor NEVER proposes finalizing an animal-treatment/welfare/
+  breeding decision, or overriding a farm safety officer's judgment —
+  no such op exists anywhere in the closed allowlist below
+  (`husbandry.governor/closed-op-allowlist`), and the rationale text
+  this advisor emits never uses a finalization/execution phrase for
+  any of those actions (`husbandry.governor/scope-excluded-terms`), so
+  the advisor's own DEFAULT proposals never self-trip the governor's
+  scope-exclusion check (see `husbandry.governor-test/
+  default-mock-advisor-proposals-never-self-trip-scope-exclusion`).
+  Any observation suggesting an animal-welfare concern or injury risk
+  is surfaced ONLY via `:flag-welfare-concern`, which always escalates
+  to a human and never auto-commits — the robot's role ends at \"here
+  is the feeding/roster/condition-check-in status\", never \"here is
+  whether the animal is fit for breeding\" or \"here is the treatment
+  decision\". This actor coordinates FARM SCHEDULING/LOGISTICS ONLY —
+  it never handles the animals and never makes treatment decisions
+  itself.
+
+  A proposal:
+  {:op :log-work-record|:schedule-crew-operation|
+       :flag-welfare-concern|:coordinate-supply-order
+   :effect :propose :worker-id str :farm-id (str or nil, only nil for
+   :flag-welfare-concern) :stake kw :confidence n :rationale str, plus
+   op-specific fields (:checkin-id/:feeding-schedule-status/
+   :animal-condition-checkin/:timestamp for log-work-record;
+   :task-id/:proposed-time/:crew-id for schedule-crew-operation;
+   :reason/:note for flag-welfare-concern; :item/:cost/:vendor for
+   coordinate-supply-order)}"
+  (:require [clojure.edn :as edn]))
+
+(defprotocol Advisor
+  (-advise [advisor store request] "request -> proposal map"))
+
+(defn- rationale-for [op farm-id]
+  (str "documented " (name op)
+       (if farm-id (str " for farm " farm-id) " (no farm yet — new-farm intake)")))
+
+(defn- infer [_store {:keys [op stake worker-id farm-id] :as request}]
+  (let [base {:op op
+              :effect :propose
+              :worker-id worker-id
+              :farm-id farm-id
+              :stake (or stake :low)
+              :confidence (case (or stake :low) :high 0.7 :medium 0.85 :low 0.95)
+              :rationale (rationale-for op farm-id)}]
+    (merge base
+           (case op
+             :log-work-record
+             (select-keys request [:checkin-id :feeding-schedule-status :animal-condition-checkin :timestamp])
+             :schedule-crew-operation
+             (select-keys request [:task-id :proposed-time :crew-id])
+             :flag-welfare-concern
+             (select-keys request [:reason :note])
+             :coordinate-supply-order
+             (select-keys request [:item :cost :vendor])
+             {}))))
+
+(defn mock-advisor []
+  (reify Advisor
+    (-advise [_ store request] (infer store request))))
+
+(def ^:private system-prompt
+  "You are a farm scheduling/logistics coordination advisor for an
+   animal-producer farm operation. Given a request, propose an :op,
+   the :worker-id and (when relevant) :farm-id plus the op's own
+   fields, an honest :confidence and a :stake. You are a farm
+   scheduling/logistics coordination robot ONLY — you help log
+   feeding-schedule/animal-condition-check-in records, schedule crew/
+   task operations, and coordinate feed/supplies procurement orders.
+   Never propose an op outside the closed four-op allowlist
+   (:log-work-record, :schedule-crew-operation, :flag-welfare-concern,
+   :coordinate-supply-order), and NEVER propose finalizing an animal-
+   treatment/welfare/breeding decision, or overriding a farm safety
+   officer's judgment — that authority does not exist for you, under
+   any circumstance, at any confidence level, in any phase. A
+   :log-work-record entry is feeding-schedule/animal-condition-check-
+   in metadata only, never a treatment or breeding decision. A
+   :schedule-crew-operation proposal is crew/task scheduling logistics
+   only — never a live animal-handling override or a farm-safety-
+   officer-judgment override. You never handle the animals and never
+   make a treatment or breeding decision yourself. Any indication that
+   an animal-welfare concern or injury risk needs human attention must
+   be surfaced only via :flag-welfare-concern, which always requires
+   human review regardless of confidence. The governor independently
+   verifies worker/farm registration and always escalates welfare-
+   concern flags and above-threshold supply orders to a human.")
+
+(defn- parse-proposal [content]
+  (try
+    (let [p (edn/read-string content)]
+      (if (map? p)
+        (assoc p :effect :propose)
+        {:op :unknown :effect :propose :confidence 0.0 :stake :high
+         :rationale "unparseable LLM response"}))
+    (catch #?(:clj Exception :cljs js/Error) _
+      {:op :unknown :effect :propose :confidence 0.0 :stake :high
+       :rationale "LLM response parse failure"})))
+
+(defn llm-advisor
+  [chat-model model-generate-fn gen-opts]
+  (reify Advisor
+    (-advise [_ _store request]
+      (let [msgs [{:role :system :content system-prompt}
+                  {:role :user :content (str "operation request: " (pr-str request))}]
+            resp (model-generate-fn chat-model msgs gen-opts)]
+        (parse-proposal (:content resp))))))

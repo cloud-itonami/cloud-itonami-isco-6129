@@ -1,0 +1,11 @@
+[{:itonami.blueprint/social-impact [:animal-welfare-integrity :worker-safety :farm-logistics-transparency]
+  :itonami.blueprint/domain :agriculture/animal-producer-farm-scheduling-and-logistics-coordination
+  :itonami.blueprint/required-technologies [:robotics :identity :audit-ledger]
+  :itonami.blueprint/isco-08 "6129"
+  :itonami.blueprint/name "Animal Producer Farm Scheduling and Logistics Coordination Practice"
+  :itonami.blueprint/governor :husbandry-governor
+  :itonami.blueprint/robotics true
+  :db/id -1
+  :itonami.blueprint/status :public-oss
+  :itonami.blueprint/id "cloud-itonami-isco-6129"
+  :itonami.blueprint/license "AGPL-3.0-or-later"}]

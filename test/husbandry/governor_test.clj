@@ -1,0 +1,301 @@
+(ns husbandry.governor-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [husbandry.store :as store]
+            [husbandry.advisor :as advisor]
+            [husbandry.governor :as governor]))
+
+(defn- fresh-store []
+  (let [st (store/mem-store)]
+    (store/register-worker! st {:worker-id "W-1" :name "Worker Kobo"
+                                :farm-id "farm-9" :verified? true})
+    (store/register-farm! st {:farm-id "farm-9"
+                              :max-supply-cost 800 :verified? true})
+    st))
+
+(defn- log-op []
+  {:op :log-work-record :effect :propose :worker-id "W-1" :farm-id "farm-9"
+   :checkin-id "C-1" :feeding-schedule-status :on-schedule
+   :animal-condition-checkin :serviceable
+   :timestamp "2026-07-18T10:00:00Z" :stake :low :confidence 0.9
+   :rationale "documented log-work-record for farm farm-9"})
+
+(defn- schedule-op []
+  {:op :schedule-crew-operation :effect :propose :worker-id "W-1" :farm-id "farm-9"
+   :task-id "T-12" :proposed-time "2026-07-20T09:00:00Z"
+   :crew-id "crew-4" :stake :low :confidence 0.9
+   :rationale "documented schedule-crew-operation for farm farm-9"})
+
+(defn- flag-op
+  ([] (flag-op nil))
+  ([farm-id]
+   {:op :flag-welfare-concern :effect :propose :worker-id "W-1" :farm-id farm-id
+    :reason :animal-welfare :note "animal showing signs of fatigue, recommend farm review"
+    :stake :low :confidence 0.9
+    :rationale "documented flag-welfare-concern for farm (no farm yet — new-farm intake)"}))
+
+(defn- supply-op [cost]
+  {:op :coordinate-supply-order :effect :propose :worker-id "W-1" :farm-id "farm-9"
+   :item "feed restock" :cost cost :vendor "FarmSupplyCo" :stake :low :confidence 0.9
+   :rationale "documented coordinate-supply-order for farm farm-9"})
+
+(def ^:private req {})
+
+;; --- happy path -----------------------------------------------------
+
+(deftest ok-well-formed-log-entry
+  (let [st (fresh-store)
+        v (governor/check req {} (log-op) st)]
+    (is (:ok? v))
+    (is (not (:hard? v)))
+    (is (not (:escalate? v)))))
+
+(deftest ok-well-formed-crew-scheduling
+  (let [st (fresh-store)
+        v (governor/check req {} (schedule-op) st)]
+    (is (:ok? v))))
+
+(deftest ok-at-or-below-threshold-supply-order
+  (let [st (fresh-store)
+        v (governor/check req {} (supply-op 400) st)]
+    (is (:ok? v))))
+
+(deftest ok-at-exact-supply-cost-threshold-boundary
+  (testing "the supply-cost escalation threshold is inclusive (exactly-at-threshold does not escalate)"
+    (let [st (fresh-store)
+          v (governor/check req {} (supply-op governor/supply-cost-escalation-threshold) st)]
+      (is (:ok? v))
+      (is (not (:escalate? v))))))
+
+;; --- worker provenance ----------------------------------------------
+
+(deftest hard-on-unregistered-worker
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :worker-id "ghost") st)]
+    (is (:hard? v))
+    (is (some #(= :unknown-worker (:rule %)) (:violations v)))))
+
+(deftest hard-on-unverified-worker
+  (let [st (fresh-store)]
+    (store/register-worker! st {:worker-id "W-2" :name "Unverified"
+                                :farm-id "farm-9" :verified? false})
+    (let [v (governor/check req {} (assoc (log-op) :worker-id "W-2") st)]
+      (is (:hard? v))
+      (is (some #(= :worker-unverified (:rule %)) (:violations v))))))
+
+;; --- farm provenance ---------------------------------------------
+
+(deftest hard-on-missing-farm-id
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :farm-id nil) st)]
+    (is (:hard? v))
+    (is (some #(= :missing-farm-id (:rule %)) (:violations v)))))
+
+(deftest hard-on-unknown-farm
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :farm-id "farm-ghost") st)]
+    (is (:hard? v))
+    (is (some #(= :unknown-farm (:rule %)) (:violations v)))))
+
+(deftest hard-on-unverified-farm
+  (let [st (fresh-store)]
+    (store/register-farm! st {:farm-id "farm-2" :max-supply-cost 800 :verified? false})
+    (let [v (governor/check req {} (assoc (log-op) :farm-id "farm-2") st)]
+      (is (:hard? v))
+      (is (some #(= :farm-unverified (:rule %)) (:violations v))))))
+
+(deftest hard-on-farm-mismatch
+  (let [st (fresh-store)]
+    (store/register-farm! st {:farm-id "farm-3" :max-supply-cost 800 :verified? true})
+    (let [v (governor/check req {} (assoc (log-op) :farm-id "farm-3") st)]
+      (is (:hard? v))
+      (is (some #(= :farm-mismatch (:rule %)) (:violations v))))))
+
+(deftest flag-welfare-concern-does-not-require-existing-farm
+  (testing "flag-welfare-concern is the channel by which a brand-new farm, or an urgent concern with no farm on
+            file yet, is surfaced for human intake"
+    (let [st (fresh-store)
+          v (governor/check req {} (flag-op nil) st)]
+      (is (not (:hard? v)))
+      (is (:escalate? v)))))
+
+;; --- no-actuation / closed allowlist ----------------------------------
+
+(deftest hard-on-no-actuation-violation
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :effect :direct-write) st)]
+    (is (:hard? v))
+    (is (some #(= :no-actuation (:rule %)) (:violations v)))))
+
+(deftest hard-on-op-not-allowed-finalize-breeding-decision
+  (testing "no path through this actor can finalize an animal-treatment/welfare/breeding decision — no such op
+            exists in the allowlist to begin with; this asserts the governor also rejects one forged onto a
+            proposal"
+    (let [st (fresh-store)
+          v (governor/check req {} (assoc (log-op) :op :finalize-breeding-decision) st)]
+      (is (:hard? v))
+      (is (some #(= :op-not-allowed (:rule %)) (:violations v))))))
+
+(deftest hard-on-op-not-allowed-determine-animal-fitness-for-breeding
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :op :determine-animal-fitness-for-breeding) st)]
+    (is (:hard? v))
+    (is (some #(= :op-not-allowed (:rule %)) (:violations v)))))
+
+(deftest hard-on-op-not-allowed-override-farm-safety-officer-judgment
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :op :override-farm-safety-officer-judgment) st)]
+    (is (:hard? v))
+    (is (some #(= :op-not-allowed (:rule %)) (:violations v)))))
+
+(deftest hard-on-op-not-allowed-authorize-veterinary-treatment
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :op :authorize-veterinary-treatment) st)]
+    (is (:hard? v))
+    (is (some #(= :op-not-allowed (:rule %)) (:violations v)))))
+
+(deftest hard-on-op-not-allowed-decide-animal-welfare-disposition
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :op :decide-animal-welfare-disposition) st)]
+    (is (:hard? v))
+    (is (some #(= :op-not-allowed (:rule %)) (:violations v)))))
+
+(deftest every-scope-excluded-op-name-is-rejected
+  (testing "every explicitly named scope-excluded op fixture is a hard, permanent block"
+    (let [st (fresh-store)]
+      (doseq [op governor/scope-excluded-ops]
+        (let [v (governor/check req {} (assoc (log-op) :op op) st)]
+          (is (:hard? v) (str "op " op " was not hard-blocked"))
+          (is (some #(= :op-not-allowed (:rule %)) (:violations v))
+              (str "op " op " did not trip :op-not-allowed")))))))
+
+;; --- work-record decision / crew-schedule override forbidden -------
+
+(deftest hard-on-work-record-decision-forbidden-treatment-decision-key
+  (testing "log-work-record is a physical feeding-schedule/animal-condition-check-in metadata record only —
+            treatment decisions are forbidden"
+    (let [st (fresh-store)
+          v (governor/check req {} (assoc (log-op) :treatment-decision "administer rest day") st)]
+      (is (:hard? v))
+      (is (some #(= :work-record-decision-forbidden (:rule %)) (:violations v))))))
+
+(deftest hard-on-work-record-decision-forbidden-breeding-decision-key
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :breeding-decision "pair with sire-4") st)]
+    (is (:hard? v))
+    (is (some #(= :work-record-decision-forbidden (:rule %)) (:violations v)))))
+
+(deftest hard-on-work-record-decision-forbidden-welfare-disposition-key
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :welfare-disposition :cleared) st)]
+    (is (:hard? v))
+    (is (some #(= :work-record-decision-forbidden (:rule %)) (:violations v)))))
+
+(deftest hard-on-crew-schedule-override-forbidden-farm-safety-officer-key
+  (testing "schedule-crew-operation never carries a farm-safety-officer-judgment override"
+    (let [st (fresh-store)
+          v (governor/check req {} (assoc (schedule-op) :farm-safety-officer-override "proceed despite hazard flag") st)]
+      (is (:hard? v))
+      (is (some #(= :crew-schedule-override-forbidden (:rule %)) (:violations v))))))
+
+(deftest hard-on-crew-schedule-override-forbidden-worker-safety-judgment-key
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (schedule-op) :worker-safety-judgment-override "push through fatigue") st)]
+    (is (:hard? v))
+    (is (some #(= :crew-schedule-override-forbidden (:rule %)) (:violations v)))))
+
+(deftest hard-on-crew-schedule-override-forbidden-animal-handling-judgment-key
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (schedule-op) :animal-handling-judgment-override "push through fatigue") st)]
+    (is (:hard? v))
+    (is (some #(= :crew-schedule-override-forbidden (:rule %)) (:violations v)))))
+
+;; --- scope-excluded rationale (defense-in-depth) -----------------------
+
+(deftest hard-on-scope-excluded-breeding-finalization-rationale
+  (testing "a proposal on an otherwise-allowed op whose rationale names a finalization action for a breeding
+            decision is a permanent HARD block, independent of the op-allowlist check"
+    (let [st (fresh-store)
+          v (governor/check req {} (assoc (log-op) :rationale "logged the check-in in order to finalize the breeding decision") st)]
+      (is (:hard? v))
+      (is (some #(= :scope-excluded (:rule %)) (:violations v))))))
+
+(deftest hard-on-scope-excluded-farm-safety-officer-override-rationale
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :rationale "logged the check-in to override the farm safety officer's judgment") st)]
+    (is (:hard? v))
+    (is (some #(= :scope-excluded (:rule %)) (:violations v)))))
+
+(deftest hard-on-scope-excluded-animal-fitness-for-breeding-rationale
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :rationale "logged the check-in to determine the animal's fitness for breeding") st)]
+    (is (:hard? v))
+    (is (some #(= :scope-excluded (:rule %)) (:violations v)))))
+
+(deftest hard-on-scope-excluded-veterinary-treatment-rationale
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :rationale "logged the check-in to order the veterinary treatment") st)]
+    (is (:hard? v))
+    (is (some #(= :scope-excluded (:rule %)) (:violations v)))))
+
+(deftest hard-on-scope-excluded-note-field
+  (testing "the scope-exclusion check also inspects :note (used by flag-welfare-concern)"
+    (let [st (fresh-store)
+          v (governor/check req {} (assoc (flag-op "farm-9") :note "recommend we finalize the breeding decision now") st)]
+      (is (:hard? v))
+      (is (some #(= :scope-excluded (:rule %)) (:violations v))))))
+
+;; --- escalation ---------------------------------------------------------
+
+(deftest always-escalates-flag-welfare-concern-even-at-high-confidence
+  (testing "surfacing a welfare concern always requires human review"
+    (let [st (fresh-store)
+          v (governor/check req {} (assoc (flag-op "farm-9") :confidence 0.99) st)]
+      (is (not (:hard? v)))
+      (is (:escalate? v)))))
+
+(deftest always-escalates-above-threshold-supply-order
+  (testing "a feed/supplies order above the cost threshold always needs human sign-off"
+    (let [st (fresh-store)
+          v (governor/check req {} (assoc (supply-op (+ governor/supply-cost-escalation-threshold 1))
+                                          :confidence 0.99)
+                            st)]
+      (is (not (:hard? v)))
+      (is (:escalate? v)))))
+
+(deftest escalates-low-confidence
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :confidence 0.3) st)]
+    (is (not (:hard? v)))
+    (is (:escalate? v))))
+
+;; --- fleet-known self-trip regression -----------------------------------
+
+(deftest default-mock-advisor-proposals-never-self-trip-scope-exclusion
+  (testing "the default mock advisor's own rationale text for every op in the closed allowlist never contains a
+            scope-excluded finalization/execution phrase for an animal-treatment/welfare/breeding decision, or an
+            override of a farm safety officer's or worker's safety judgment -- crucially, :flag-welfare-concern's
+            own op name contains the bare noun \"welfare\", so this asserts the term list is phrased as full
+            finalization/execution actions rather than bare nouns"
+    (let [st (fresh-store)
+          adv (advisor/mock-advisor)
+          requests [{:op :log-work-record :worker-id "W-1" :farm-id "farm-9" :stake :low
+                     :checkin-id "C-1" :feeding-schedule-status :on-schedule
+                     :animal-condition-checkin :serviceable
+                     :timestamp "2026-07-18T10:00:00Z"}
+                    {:op :schedule-crew-operation :worker-id "W-1" :farm-id "farm-9" :stake :low
+                     :task-id "T-12" :proposed-time "2026-07-20T09:00:00Z" :crew-id "crew-4"}
+                    {:op :flag-welfare-concern :worker-id "W-1" :farm-id "farm-9" :stake :low
+                     :reason :animal-welfare :note "animal showing signs of fatigue, recommend farm review"}
+                    {:op :flag-welfare-concern :worker-id "W-1" :farm-id nil :stake :low
+                     :reason :injury-risk :note "new farm intake needs equipment audit"}
+                    {:op :coordinate-supply-order :worker-id "W-1" :farm-id "farm-9" :stake :low
+                     :item "feed restock" :cost 40 :vendor "FarmSupplyCo"}]]
+      (doseq [req' requests]
+        (let [proposal (advisor/-advise adv st req')]
+          (is (false? (governor/out-of-scope? proposal))
+              (str "op " (:op req') " self-tripped scope-exclusion: " (:rationale proposal)))
+          (let [v (governor/check {} {} proposal st)]
+            (is (not (contains? (set (map :rule (:violations v))) :scope-excluded))
+                (str "op " (:op req') " tripped :scope-excluded in governor/check"))
+            (is (not (contains? (set (map :rule (:violations v))) :op-not-allowed))
+                (str "op " (:op req') " tripped :op-not-allowed in governor/check"))))))))
