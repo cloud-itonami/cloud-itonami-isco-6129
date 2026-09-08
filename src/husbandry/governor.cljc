@@ -123,7 +123,7 @@
                                 NOT a hard block, since an over-budget
                                 supply order is not itself unsafe).
     10. low confidence (< `confidence-floor`)."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [husbandry.store :as store]))
 
 (def confidence-floor 0.6)
